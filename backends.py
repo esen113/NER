@@ -55,7 +55,13 @@ def infer_vllm(model_path: str, messages_list: List[List[Dict[str, str]]],
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
-    llm = LLM(model=model_path, tensor_parallel_size=tensor_parallel_size, trust_remote_code=trust_remote_code)
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        trust_remote_code=trust_remote_code,
+        max_model_len=4096,
+        gpu_memory_utilization=0.92,
+    )
     prompts = []
     for messages in messages_list:
         prompt = _apply_chat_template_if_available(tokenizer, messages)

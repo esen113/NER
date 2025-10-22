@@ -1,5 +1,5 @@
 import json, re, ast
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import json5
 
 def robust_json_parse(text: str) -> Dict[str, Any]:
@@ -101,3 +101,63 @@ def relation_vocab_of_dataset(ds) -> List[str]:
         for _, r, _ in item["triple_list"]:
             rels.add(str(r))
     return sorted(rels)
+
+def parse_semantic_judgment(text: str) -> int:
+    """
+    Parse the model's semantic evaluation output and map it to {0,1}.
+    Falls back to 0 if the intent cannot be determined.
+    """
+    text = (text or "").strip()
+
+    def _coerce(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (int, float)):
+            return 1 if int(value) == 1 else 0 if int(value) == 0 else None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped in {"1", "0"}:
+                return int(stripped)
+            if stripped.lower() in {"yes", "true"}:
+                return 1
+            if stripped.lower() in {"no", "false"}:
+                return 0
+        return None
+
+    def _extract(obj: Any) -> Optional[int]:
+        if isinstance(obj, dict):
+            for key in ["semantic_match", "match", "verdict", "result", "score"]:
+                if key in obj:
+                    coerced = _coerce(obj[key])
+                    if coerced is not None:
+                        return coerced
+        coerced = _coerce(obj)
+        if coerced is not None:
+            return coerced
+        if isinstance(obj, list) and len(obj) == 1:
+            return _extract(obj[0])
+        return None
+
+    parsers = [json.loads, json5.loads]
+    for parser in parsers:
+        try:
+            obj = parser(text)
+            val = _extract(obj)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+
+    try:
+        obj = ast.literal_eval(text)
+        val = _extract(obj)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+
+    m = re.search(r"\b([01])\b", text)
+    if m:
+        return int(m.group(1))
+
+    return 0

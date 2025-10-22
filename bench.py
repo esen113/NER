@@ -2,8 +2,8 @@ import argparse, os, json, time, csv
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 
-from prompting import build_messages
-from utils import robust_json_parse, to_tuple_list, read_dataset, relation_vocab_of_dataset
+from prompting import build_messages, build_evaluation_messages
+from utils import robust_json_parse, to_tuple_list, read_dataset, relation_vocab_of_dataset, parse_semantic_judgment
 from metrics import micro_prf, headtail_micro_prf, entity_micro_prf, relation_bag_micro_prf, per_relation_f1, macro_from_per_class
 
 def run_one_model_on_dataset(
@@ -33,18 +33,46 @@ def run_one_model_on_dataset(
     # Build messages
     messages_list = [build_messages(item["text"], rel_vocab) for item in ds]
 
+    def infer_with_backend(messages_subset: List[List[Dict[str, Any]]]) -> List[str]:
+        if backend == "transformers":
+            from backends import infer_transformers
+            return infer_transformers(
+                model_path,
+                messages_subset,
+                max_new_tokens,
+                temperature,
+                top_p,
+                dtype,
+                device_map,
+            )
+        elif backend == "vllm":
+            from backends import infer_vllm
+            return infer_vllm(
+                model_path,
+                messages_subset,
+                max_new_tokens,
+                temperature,
+                top_p,
+                tensor_parallel_size,
+                True,
+                batch_size,
+            )
+        elif backend == "llama_cpp":
+            from backends import infer_llama_cpp
+            return infer_llama_cpp(
+                model_path,
+                messages_subset,
+                max_new_tokens,
+                temperature,
+                top_p,
+                n_ctx,
+                n_gpu_layers,
+            )
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+
     # Inference
-    if backend == "transformers":
-        from backends import infer_transformers
-        outputs = infer_transformers(model_path, messages_list, max_new_tokens, temperature, top_p, dtype, device_map)
-    elif backend == "vllm":
-        from backends import infer_vllm
-        outputs = infer_vllm(model_path, messages_list, max_new_tokens, temperature, top_p, tensor_parallel_size, True, batch_size)
-    elif backend == "llama_cpp":
-        from backends import infer_llama_cpp
-        outputs = infer_llama_cpp(model_path, messages_list, max_new_tokens, temperature, top_p, n_ctx, n_gpu_layers)
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
+    outputs = infer_with_backend(messages_list)
 
     preds = []
     for out in outputs:
@@ -53,6 +81,17 @@ def run_one_model_on_dataset(
         preds.append(triples)
 
     gold = [item["triple_list"] for item in ds]
+
+    # Semantic evaluation using the same backend/model
+    eval_messages_list = [
+        build_evaluation_messages(item["text"], gold_triples, pred_triples)
+        for item, gold_triples, pred_triples in zip(ds, gold, preds)
+    ]
+    eval_outputs = infer_with_backend(eval_messages_list)
+    semantic_scores = [parse_semantic_judgment(out) for out in eval_outputs]
+    semantic_matches = sum(semantic_scores)
+    total_samples = len(semantic_scores) if semantic_scores else 0
+    semantic_accuracy = (semantic_matches / total_samples) if total_samples else 0.0
 
     # Metrics
     triple_em = micro_prf(preds, gold)
@@ -65,11 +104,34 @@ def run_one_model_on_dataset(
     # Save artifacts
     model_dir = os.path.join(save_dir, os.path.basename(dataset_path).replace(".json",""), model_name)
     os.makedirs(model_dir, exist_ok=True)
+    logs_dir = os.path.join(model_dir, "sample_logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
     # Save predictions
     with open(os.path.join(model_dir, "predictions.jsonl"), "w", encoding="utf-8") as f:
-        for item, out, tri in zip(ds, outputs, preds):
-            rec = {"text": item["text"], "pred_triples": tri, "gold_triples": item["triple_list"]}
+        for idx, (item, out, tri, eval_out, score) in enumerate(zip(ds, outputs, preds, eval_outputs, semantic_scores)):
+            rec = {
+                "text": item["text"],
+                "pred_triples": [list(t) for t in tri],
+                "gold_triples": [list(t) for t in item["triple_list"]],
+                "semantic_match": score,
+            }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            log_record = {
+                "text": item["text"],
+                "gold_triples": [list(t) for t in item["triple_list"]],
+                "predicted_triples": [list(t) for t in tri],
+                "semantic_match": score,
+                "extraction_prompt": messages_list[idx][-1]["content"],
+                "evaluation_prompt": eval_messages_list[idx][-1]["content"],
+                "raw_extraction_output": out,
+                "raw_evaluation_output": eval_out,
+            }
+            sample_path = os.path.join(logs_dir, f"sample_{idx+1:04d}.json")
+            with open(sample_path, "w", encoding="utf-8") as log_f:
+                json.dump(log_record, log_f, ensure_ascii=False, indent=2)
+
     # Save metrics
     metrics = {
         "backend": backend,
@@ -82,6 +144,11 @@ def run_one_model_on_dataset(
         "relation_bag_micro": rel,
         "per_relation_f1": per_rel,
         "per_relation_macro": macro_rel,
+        "semantic_alignment": {
+            "accuracy": semantic_accuracy,
+            "matches": semantic_matches,
+            "total": total_samples,
+        },
     }
     with open(os.path.join(model_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -139,6 +206,7 @@ def main():
                 "entity_f1": metrics["entity_micro"]["f1"],
                 "relation_bag_f1": metrics["relation_bag_micro"]["f1"],
                 "relation_macro_f1": metrics["per_relation_macro"]["f1"],
+                "semantic_alignment_acc": metrics["semantic_alignment"]["accuracy"],
             }
             summary_rows.append(row)
 

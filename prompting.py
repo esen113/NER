@@ -1,5 +1,5 @@
 # prompting.py
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import json  # 新增
 
 SYSTEM_PROMPT = """\
@@ -33,6 +33,26 @@ Respond with JSON only.
 def build_user_prompt(text: str, relation_vocab: List[str]) -> str:
     vocab_str = ", ".join(sorted(relation_vocab)) if relation_vocab else "N/A"
     return USER_PROMPT_TEMPLATE.format(text=text, relation_vocab=vocab_str)
+
+EVAL_SYSTEM_PROMPT = """\
+You are an impartial judge who evaluates information extraction quality.
+Given a passage, a list of reference subject-relation-object triples, and a list of extracted triples, determine whether the extracted triples express exactly the same factual meaning as the reference triples. Answer strictly with valid JSON and do not include explanations."""
+
+EVAL_USER_PROMPT_TEMPLATE = """\
+Passage:
+\"\"\"{text}\"\"\"
+
+Reference triples (JSON):
+{gold}
+
+Extracted triples (JSON):
+{pred}
+
+Respond with JSON only using this schema:
+{{
+  "semantic_match": 1
+}}
+Use 1 when and only when the extracted triples convey the same facts as the reference triples without adding or omitting information. Otherwise respond with 0."""
 
 # ====== 你要塞进 prompt 的 few-shot 示例（直接用）======
 FEWSHOTS = [
@@ -83,3 +103,27 @@ def build_messages(text: str, relation_vocab: List[str]) -> List[Dict[str, Any]]
     messages.append({"role": "user", "content": build_user_prompt(text, relation_vocab)})
     return messages
 
+def _triples_to_json(triples: List[Tuple[str, str, str]]) -> str:
+    # Keep non-ASCII characters from the dataset intact.
+    return json.dumps(
+        [{"head": h, "relation": r, "tail": t} for h, r, t in triples],
+        ensure_ascii=False,
+    )
+
+def build_evaluation_messages(
+    text: str,
+    gold_triples: List[Tuple[str, str, str]],
+    predicted_triples: List[Tuple[str, str, str]],
+) -> List[Dict[str, Any]]:
+    messages = [
+        {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": EVAL_USER_PROMPT_TEMPLATE.format(
+                text=text,
+                gold=_triples_to_json(gold_triples),
+                pred=_triples_to_json(predicted_triples),
+            ),
+        },
+    ]
+    return messages
